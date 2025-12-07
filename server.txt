@@ -1,0 +1,274 @@
+// server.cpp
+// Compile: g++ -std=c++17 server.cpp -o server -pthread
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <ctime>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+constexpr int TCP_PORT = 5000;
+constexpr int UDP_PORT = 6000;
+constexpr int BUFFER_SIZE = 4096;
+
+std::mutex cout_m;
+void log(const std::string &s){
+std::lock_guard<std::mutex> g(cout_m);
+std::time_t t = std::time(nullptr);
+std::cout << "[" << std::asctime(std::localtime(&t)) << "] " << s << std::endl;
+}
+
+// Hard-coded credentials
+std::map<std::string, std::string> credentials = {
+{"Lahore", "NU-LHR-123"},
+{"Karachi", "NU-KHI-123"},
+{"Peshawar", "NU-PEW-123"},
+{"CFD", "NU-CFD-123"},
+{"Multan", "NU-MUL-123"},
+{"Islamabad", "NU-ISB-123"} // if needed
+};
+
+// TCP maps
+std::mutex map_m;
+std::map<std::string, int> campus_tcp_sock; // campus -> tcp socket fd
+std::map<std::string, sockaddr_in> campus_udp_addr; // campus -> udp endpoint (from heartbeat)
+std::map<int, std::string> sock_to_campus; // reverse lookup
+
+// Utility: parse semicolon key:value pairs
+std::map<std::string,std::string> parse_kv_line(const std::string &line){
+std::map<std::string,std::string> out;
+std::stringstream ss(line);
+std::string token;
+while(std::getline(ss, token, ';')){
+auto pos = token.find(':');
+if(pos!=std::string::npos){
+std::string k = token.substr(0,pos);
+std::string v = token.substr(pos+1);
+out[k] = v;
+} else {
+// maybe first token like AUTH or MSG
+out["TYPE"] = token;
+}
+}
+return out;
+}
+
+void send_tcp(int sock, const std::string &msg){
+ssize_t n = send(sock, msg.c_str(), msg.size(), 0);
+if(n < 0) log("send failed");
+}
+
+// Forward TCP message to destination campus if connected
+void route_message(const std::string &from, const std::string &to, const std::string &dept, const std::string &body){
+std::lock_guard<std::mutex> g(map_m);
+if(campus_tcp_sock.count(to)){
+int dest_sock = campus_tcp_sock[to];
+std::stringstream ss;
+ss << "DELIVER;From:" << from << ";Dept:" << dept << ";Body:" << body << "\n";
+send_tcp(dest_sock, ss.str());
+log("Routed message from " + from + " to " + to);
+} else {
+log("Destination " + to + " not connected. Could queue or return error.");
+if(campus_tcp_sock.count(from)){
+int from_sock = campus_tcp_sock[from];
+send_tcp(from_sock, std::string("ERROR;Reason:DestinationNotConnected\n"));
+}
+}
+}
+
+// TCP client handler thread
+void client_thread_fn(int client_sock, sockaddr_in client_addr){
+char buf[BUFFER_SIZE];
+std::string campus_name = "";
+bool authenticated = false;
+// Read loop
+while(true){
+ssize_t len = recv(client_sock, buf, sizeof(buf)-1, 0);
+if(len <= 0){
+log("Client socket closed or error.");
+break;
+}
+buf[len] = '\0';
+std::string data(buf);
+// Could be multiple lines; parse line by line
+std::stringstream ss(data);
+std::string line;
+while(std::getline(ss, line)){
+if(line.size()==0) continue;
+auto kv = parse_kv_line(line);
+std::string type = kv.count("TYPE") ? kv["TYPE"] : "";
+if(type == "AUTH"){
+// expecting Campus:<name>;Pass:<pwd>
+std::string campus = kv.count("Campus") ? kv["Campus"] : "";
+std::string pass = kv.count("Pass") ? kv["Pass"] : "";
+if(campus.empty() || pass.empty()){
+send_tcp(client_sock, "AUTH_RESP;Status:FAIL;Reason:BadFormat\n");
+continue;
+}
+if(credentials.count(campus) && credentials[campus] == pass){
+{
+std::lock_guard<std::mutex> g(map_m);
+campus_tcp_sock[campus] = client_sock;
+sock_to_campus[client_sock] = campus;
+}
+authenticated = true;
+campus_name = campus;
+send_tcp(client_sock, "AUTH_RESP;Status:OK\n");
+log("Authenticated campus " + campus);
+} else {
+send_tcp(client_sock, "AUTH_RESP;Status:FAIL;Reason:InvalidCredentials\n");
+log("Auth failed for campus " + campus);
+}
+} else if(type == "MSG"){
+if(!authenticated){
+send_tcp(client_sock, "ERROR;Reason:NotAuthenticated\n");
+continue;
+}
+std::string from = kv.count("From") ? kv["From"] : campus_name;
+std::string to = kv.count("To") ? kv["To"] : "";
+std::string dept = kv.count("Dept") ? kv["Dept"] : "";
+std::string body = kv.count("Body") ? kv["Body"] : "";
+if(to.empty()){
+send_tcp(client_sock, "ERROR;Reason:NoDestination\n");
+continue;
+}
+route_message(from, to, dept, body);
+} else {
+send_tcp(client_sock, "ERROR;Reason:UnknownType\n");
+}
+}
+}
+// cleanup on disconnect
+{
+std::lock_guard<std::mutex> g(map_m);
+if(!campus_name.empty()){
+campus_tcp_sock.erase(campus_name);
+log("Campus disconnected: " + campus_name);
+}
+sock_to_campus.erase(client_sock);
+}
+close(client_sock);
+}
+
+// UDP listener: listens for heartbeats and records the sender address for later broadcasts
+void udp_listener(){
+int udpfd = socket(AF_INET, SOCK_DGRAM, 0);
+if(udpfd < 0){ log("udp socket create failed"); return; }
+sockaddr_in addr{};
+addr.sin_family = AF_INET;
+addr.sin_addr.s_addr = INADDR_ANY;
+addr.sin_port = htons(UDP_PORT);
+if(bind(udpfd, (sockaddr*)&addr, sizeof(addr)) < 0){
+log("UDP bind failed");
+close(udpfd); return;
+}
+char buf[BUFFER_SIZE];
+while(true){
+sockaddr_in src{};
+socklen_t slen = sizeof(src);
+ssize_t n = recvfrom(udpfd, buf, sizeof(buf)-1, 0, (sockaddr*)&src, &slen);
+if(n <= 0) continue;
+buf[n] = '\0';
+std::string line(buf);
+auto kv = parse_kv_line(line);
+std::string type = kv.count("TYPE") ? kv["TYPE"] : "";
+if(type == "HEARTBEAT"){
+std::string campus = kv.count("Campus") ? kv["Campus"] : "";
+if(!campus.empty()){
+std::lock_guard<std::mutex> g(map_m);
+campus_udp_addr[campus] = src;
+// log heartbeat
+char ipbuf[INET_ADDRSTRLEN];
+inet_ntop(AF_INET, &src.sin_addr, ipbuf, sizeof(ipbuf));
+int port = ntohs(src.sin_port);
+log("Heartbeat from " + campus + " at " + std::string(ipbuf) + ":" + std::to_string(port));
+}
+}
+}
+close(udpfd);
+}
+
+// Admin console: allows broadcast via UDP to recorded client UDP endpoints
+void admin_console(){
+std::string line;
+int udpfd = socket(AF_INET, SOCK_DGRAM, 0);
+while(true){
+std::cout << "ADMIN> ";
+if(!std::getline(std::cin, line)) break;
+if(line.size() == 0) continue;
+if(line.rfind("broadcast ",0) == 0){
+std::string msg = line.substr(10);
+// send UDP to all recorded client UDP endpoints
+std::lock_guard<std::mutex> g(map_m);
+for(auto &p : campus_udp_addr){
+sockaddr_in dest = p.second;
+std::string packet = "BCAST;From:Server;Body:" + msg;
+sendto(udpfd, packet.c_str(), packet.size(), 0, (sockaddr*)&dest, sizeof(dest));
+}
+log("Broadcast sent: " + msg);
+} else if(line == "list"){
+std::lock_guard<std::mutex> g(map_m);
+std::cout << "--- Connected campuses (TCP) ---\n";
+for(auto &p: campus_tcp_sock) std::cout << p.first << "\n";
+std::cout << "--- Known UDP endpoints ---\n";
+for(auto &p: campus_udp_addr){
+char ipbuf[INET_ADDRSTRLEN];
+inet_ntop(AF_INET, &p.second.sin_addr, ipbuf, sizeof(ipbuf));
+std::cout << p.first << " -> " << ipbuf << ":" << ntohs(p.second.sin_port) << "\n";
+}
+} else {
+std::cout << "Commands: broadcast <msg>, list\n";
+}
+}
+close(udpfd);
+}
+
+int main(){
+// Start UDP listener
+std::thread udp_thread(udp_listener);
+udp_thread.detach();
+
+// Start admin console thread
+std::thread admin_thread(admin_console);
+admin_thread.detach();
+
+// TCP server setup
+int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+if(listenfd < 0){ log("socket failed"); return 1; }
+int opt = 1;
+setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+sockaddr_in servaddr{};
+servaddr.sin_family = AF_INET;
+servaddr.sin_addr.s_addr = INADDR_ANY;
+servaddr.sin_port = htons(TCP_PORT);
+if(bind(listenfd, (sockaddr*)&servaddr, sizeof(servaddr)) < 0){
+log("bind failed"); return 1;
+}
+if(listen(listenfd, 10) < 0){
+log("listen failed"); return 1;
+}
+log("Central Server running. TCP port: " + std::to_string(TCP_PORT) + " UDP port: " + std::to_string(UDP_PORT));
+while(true){
+sockaddr_in cliaddr{};
+socklen_t clilen = sizeof(cliaddr);
+int connfd = accept(listenfd, (sockaddr*)&cliaddr, &clilen);
+if(connfd < 0) continue;
+// spawn thread
+std::thread t(client_thread_fn, connfd, cliaddr);
+t.detach();
+log("Accepted new TCP client connection.");
+}
+close(listenfd);
+return 0;
+}
